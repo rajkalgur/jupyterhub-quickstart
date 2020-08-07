@@ -1,277 +1,202 @@
 import os
+import string
+import escapism
 
-import wrapt
+# Enable JupyterLab interface if enabled.
 
-from kubernetes.client.configuration import Configuration
-from kubernetes.config.incluster_config import load_incluster_config
-from kubernetes.client.api_client import ApiClient
-from kubernetes.client.rest import ApiException
-from openshift.dynamic import DynamicClient
+if os.environ.get('JUPYTERHUB_ENABLE_LAB', 'false').lower() in ['true', 'yes', 'y', '1']:
+    c.Spawner.environment = dict(JUPYTER_ENABLE_LAB='true')
 
-# Helper function for doing unit conversions or translations if needed.
+# Setup location for customised template files.
 
-def convert_size_to_bytes(size):
-    multipliers = {
-        'k': 1000,
-        'm': 1000**2,
-        'g': 1000**3,
-        't': 1000**4,
-        'ki': 1024,
-        'mi': 1024**2,
-        'gi': 1024**3,
-        'ti': 1024**4,
+c.JupyterHub.template_paths = ['/opt/app-root/src/templates']
+
+# Setup configuration for authenticating using LDAP. In this case we
+# need to deal with separate LDAP servers based on the domain name so
+# we need to provide a custom authenticator which can delegate to the
+# respective LDAP authenticator instance for the domain.
+
+from ldapauthenticator import LDAPAuthenticator
+
+c.LDAPAuthenticator.use_ssl = True
+c.LDAPAuthenticator.lookup_dn = True
+c.LDAPAuthenticator.lookup_dn_search_filter = '({login_attr}={login})'
+c.LDAPAuthenticator.escape_userdn = False
+c.LDAPAuthenticator.valid_username_regex = '^[A-Za-z0-9\\\._-]{7,}$'
+c.LDAPAuthenticator.user_attribute = 'sAMAccountName'
+c.LDAPAuthenticator.lookup_dn_user_dn_attribute = 'sAMAccountName'
+c.LDAPAuthenticator.escape_userdn = False
+
+c.LDAPAuthenticator.lookup_dn_search_user = os.environ['LDAP_SEARCH_USER']
+c.LDAPAuthenticator.lookup_dn_search_password = os.environ['LDAP_SEARCH_PASSWORD']
+
+tmw_authenticator = LDAPAuthenticator()
+tmw_authenticator.server_address = 'tmw.com'
+tmw_authenticator.bind_dn_template = ['tmw\\{username}']
+tmw_authenticator.user_search_base = 'DC=tmw'
+
+from jupyterhub.auth import Authenticator
+
+class MultiLDAPAuthenticator(Authenticator):
+
+    def authenticate(self, handler, data):
+        domain = data['domain'].lower()
+
+        data['username'] = data['username'].lower()
+
+        if domain == 'tmw':
+            return tmw_authenticator.authenticate(handler, data)        
+
+        self.log.warn('domain:%s Unknown authentication domain name', domain)
+        return None
+
+c.JupyterHub.authenticator_class = MultiLDAPAuthenticator
+
+if os.path.exists('/opt/app-root/configs/admin_users.txt'):
+    with open('/opt/app-root/configs/admin_users.txt') as fp:
+        content = fp.read().strip()
+        if content:
+            c.Authenticator.admin_users = set(content.split())
+
+if os.path.exists('/opt/app-root/configs/user_whitelist.txt'):
+    with open('/opt/app-root/configs/user_whitelist.txt') as fp:
+        c.Authenticator.whitelist = set(fp.read().strip().split())
+
+rest_api_password = os.environ.get('REST_API_PASSWORD')
+
+if rest_api_password:
+    c.JupyterHub.service_tokens = {
+        rest_api_password: 'jupyterhub-rest-api-user'
     }
 
-    size = str(size)
+# Provide persistent storage for users notebooks. We share one
+# persistent volume for all users, mounting just their subdirectory into
+# their pod. The persistent volume type needs to be ReadWriteMany so it
+# can be mounted on multiple nodes as can't control where pods for a
+# user may land. Because it is a shared volume, there are no quota
+# restrictions which prevent a specific user filling up the entire
+# persistent volume.
 
-    for suffix in multipliers:
-        if size.lower().endswith(suffix):
-            return int(size[0:-len(suffix)]) * multipliers[suffix]
+volume_version_number = os.environ.get('VOLUME_VERSION_NUMBER', '')
+
+c.KubeSpawner.user_storage_pvc_ensure = False
+c.KubeSpawner.pvc_name_template = '%s-notebooks-pvc%s' % (
+        c.KubeSpawner.hub_connect_ip, volume_version_number)
+
+c.KubeSpawner.volumes = [
+    {
+        'name': 'notebooks',
+        'persistentVolumeClaim': {
+            'claimName': c.KubeSpawner.pvc_name_template
+        }
+    }
+]
+
+volume_mounts_user = [
+    {
+        'name': 'notebooks',
+        'mountPath': '/opt/app-root/src',
+        'subPath': 'users/{username}'
+    }
+]
+
+volume_mounts_admin = [
+    {
+        'name': 'notebooks',
+        'mountPath': '/opt/app-root/src/users',
+        'subPath': 'users'
+    }
+]
+
+def interpolate_properties(spawner, template):
+    safe_chars = set(string.ascii_lowercase + string.digits)
+    username = escapism.escape(spawner.user.name, safe=safe_chars,
+            escape_char='-').lower()
+
+    return template.format(
+        userid=spawner.user.id,
+        username=username)
+
+def expand_strings(spawner, src):
+    if isinstance(src, list):
+        return [expand_strings(spawner, i) for i in src]
+    elif isinstance(src, dict):
+        return {k: expand_strings(spawner, v) for k, v in src.items()}
+    elif isinstance(src, str):
+        return interpolate_properties(spawner, src)
     else:
-        if size.lower().endswith('b'):
-            return int(size[0:-1])
+        return src
 
-    try:
-        return int(size)
-    except ValueError:
-        raise RuntimeError('"%s" is not a valid memory specification. Must be an integer or a string with suffix K, M, G, T, Ki, Mi, Gi or Ti.' % size)
-
-# Initialise client for the REST API used doing configuration.
-#
-# XXX Currently have a workaround here for OpenShift 4.0 beta versions
-# which disables verification of the certificate. If don't use this the
-# Python openshift/kubernetes clients will fail. We also disable any
-# warnings from urllib3 to get rid of the noise in the logs this creates.
-
-load_incluster_config()
-
-import urllib3
-urllib3.disable_warnings()
-instance = Configuration()
-instance.verify_ssl = False
-Configuration.set_default(instance)
-
-api_client = DynamicClient(ApiClient())
-
-image_stream_resource = api_client.resources.get(
-     api_version='image.openshift.io/v1', kind='ImageStream')
-
-route_resource = api_client.resources.get(
-     api_version='route.openshift.io/v1', kind='Route')
-
-# Work out the name of the JupyterHub deployment passed in environment.
-
-application_name = os.environ.get('APPLICATION_NAME', 'jupyterhub')
-
-# Work out the name of the namespace in which we are being deployed.
-
-service_account_path = '/var/run/secrets/kubernetes.io/serviceaccount'
-
-with open(os.path.join(service_account_path, 'namespace')) as fp:
-    namespace = fp.read().strip()
-
-# Work out hostname for the exposed route of the JupyterHub server.
-
-routes = route_resource.get(namespace=namespace)
-
-def extract_hostname(routes, name):
-    for route in routes.items:
-        if route.metadata.name == name:
-            return route.spec.host
-
-public_hostname = extract_hostname(routes, application_name)
-
-if not public_hostname:
-    raise RuntimeError('Cannot calculate external host name for JupyterHub.')
-
-# Helper function for determining the correct name for the image. We
-# need to do this for references to image streams because of the image
-# lookup policy often not being correctly setup on OpenShift clusters.
-
-def resolve_image_name(name):
-    # If the image name contains a slash, we assume it is already
-    # referring to an image on some image registry. Even if it does
-    # not contain a slash, it may still be hosted on docker.io.
-
-    if name.find('/') != -1:
-        return name
-
-    # Separate actual source image name and tag for the image from the
-    # name. If the tag is not supplied, default to 'latest'.
-
-    parts = name.split(':', 1)
-
-    if len(parts) == 1:
-        source_image, tag = parts, 'latest'
+def modify_pod_hook(spawner, pod):
+    if spawner.user.admin:
+        volume_mounts = volume_mounts_admin
+        workspace = interpolate_properties(spawner, 'users/{username}/workspace')
     else:
-        source_image, tag = parts
+        volume_mounts = volume_mounts_user
+        workspace = 'workspace'
 
-    # See if there is an image stream in the current project with the
-    # target name.
+    os.makedirs(interpolate_properties(spawner,
+            '/opt/app-root/notebooks/users/{username}'), exist_ok=True)
 
-    try:
-        image_stream = image_stream_resource.get(namespace=namespace,
-                name=source_image)
+    pod.spec.containers[0].env.append(dict(name='JUPYTER_MASTER_FILES',
+            value='/opt/app-root/master'))
+    pod.spec.containers[0].env.append(dict(name='JUPYTER_WORKSPACE_NAME',
+            value=workspace))
+    pod.spec.containers[0].env.append(dict(name='JUPYTER_SYNC_VOLUME',
+            value='true'))
 
-    except ApiException as e:
-        if e.status not in (403, 404):
-            raise
+    pod.spec.containers[0].volume_mounts.extend(
+            expand_strings(spawner, volume_mounts))
 
-        return name
+    return pod
 
-    # If we get here then the image stream exists with the target name.
-    # We need to determine if the tag exists. If it does exist, we
-    # extract out the full name of the image including the reference
-    # to the image registry it is hosted on.
+c.KubeSpawner.modify_pod_hook = modify_pod_hook
 
-    if image_stream.status.tags:
-        for entry in image_stream.status.tags:
-            if entry.tag == tag:
-                registry_image = image_stream.status.dockerImageRepository
-                if registry_image:
-                    return '%s:%s' % (registry_image, tag)
+# Setup resource limits for memory and CPU.
 
-    # Use original value if can't find a matching tag.
+cpu_request = os.environ.get('NOTEBOOK_CPU_REQUEST')
+cpu_limit = os.environ.get('NOTEBOOK_CPU_LIMIT')
 
-    return name
+if cpu_request:
+    c.Spawner.cpu_guarantee = float(cpu_request)
 
-# Define the default configuration for JupyterHub application.
+if cpu_limit:
+    c.Spawner.cpu_limit = float(cpu_limit)
 
-c.Spawner.environment = dict()
+memory_request = os.environ.get('NOTEBOOK_MEMORY_REQUEST')
+memory_limit = os.environ.get('NOTEBOOK_MEMORY_LIMIT')
 
-c.JupyterHub.services = []
+if memory_request:
+    c.Spawner.mem_guarantee = convert_size_to_bytes(memory_request)
 
-c.KubeSpawner.init_containers = []
+if memory_limit:
+    c.Spawner.mem_limit = convert_size_to_bytes(memory_limit)
 
-c.KubeSpawner.extra_containers = []
+# Setup services for backups and idle notebook culling.
 
-c.JupyterHub.extra_handlers = []
+jupyterhub_service_name = os.environ.get('JUPYTERHUB_SERVICE_NAME', 'jupyterhub')
 
-c.JupyterHub.port = 8080
+c.JupyterHub.services = [
+    {
+        'name': 'jupyterhub-rest-api-user',
+        'admin': True,
+    },
+    {
+        'name': 'backup-users',
+        'admin': True,
+        'command': ['backup-user-details',
+                '--backups=/opt/app-root/notebooks/backups',
+                '--config-map=%s-cfg-backup' % jupyterhub_service_name]
+    }
+]
 
-c.JupyterHub.hub_ip = '0.0.0.0'
-c.JupyterHub.hub_port = 8081
+idle_timeout = os.environ.get('JUPYTERHUB_IDLE_TIMEOUT')
 
-c.JupyterHub.hub_connect_ip = application_name
-
-c.ConfigurableHTTPProxy.api_url = 'http://127.0.0.1:8082'
-
-c.Spawner.start_timeout = 120
-c.Spawner.http_timeout = 60
-
-c.KubeSpawner.port = 8080
-
-c.KubeSpawner.common_labels = { 'app': application_name }
-
-c.KubeSpawner.uid = os.getuid()
-c.KubeSpawner.fs_gid = os.getuid()
-
-c.KubeSpawner.extra_annotations = {
-    "alpha.image.policy.openshift.io/resolve-names": "*"
-}
-
-c.KubeSpawner.cmd = ['start-singleuser.sh']
-
-c.KubeSpawner.pod_name_template = '%s-nb-{username}' % application_name
-
-c.JupyterHub.admin_access = True
-
-if os.environ.get('JUPYTERHUB_COOKIE_SECRET'):
-    c.JupyterHub.cookie_secret = os.environ[
-            'JUPYTERHUB_COOKIE_SECRET'].encode('UTF-8')
-else:
-    c.JupyterHub.cookie_secret_file = '/opt/app-root/data/cookie_secret'
-
-if os.environ.get('JUPYTERHUB_DATABASE_PASSWORD'):
-    c.JupyterHub.db_url = 'postgresql://jupyterhub:%s@%s:5432/%s' % (
-            os.environ['JUPYTERHUB_DATABASE_PASSWORD'],
-            os.environ['JUPYTERHUB_DATABASE_HOST'],
-            os.environ.get('JUPYTERHUB_DATABASE_NAME', 'jupyterhub'))
-else:
-    c.JupyterHub.db_url = '/opt/app-root/data/database.sqlite'
-
-c.JupyterHub.authenticator_class = 'tmpauthenticator.TmpAuthenticator'
-
-c.JupyterHub.spawner_class = 'kubespawner.KubeSpawner'
-
-c.KubeSpawner.image_spec = resolve_image_name(
-        os.environ.get('JUPYTERHUB_NOTEBOOK_IMAGE',
-        's2i-minimal-notebook:3.6'))
-
-if os.environ.get('JUPYTERHUB_NOTEBOOK_MEMORY'):
-    c.Spawner.mem_limit = convert_size_to_bytes(os.environ['JUPYTERHUB_NOTEBOOK_MEMORY'])
-
-notebook_interface = os.environ.get('JUPYTERHUB_NOTEBOOK_INTERFACE')
-
-if notebook_interface:
-    c.Spawner.environment['JUPYTER_NOTEBOOK_INTERFACE'] = notebook_interface
-
-# Workaround bug in minishift where a service cannot be contacted from a
-# pod which backs the service. For further details see the minishift issue
-# https://github.com/minishift/minishift/issues/2400.
-#
-# What these workarounds do is monkey patch the JupyterHub proxy client
-# API code, and the code for creating the environment for local service
-# processes, and when it sees something which uses the service name as
-# the target in a URL, it replaces it with localhost. These work because
-# the proxy/service processes are in the same pod. It is not possible to
-# change hub_connect_ip to localhost because that is passed to other
-# pods which need to contact back to JupyterHub, and so it must be left
-# as the service name.
-
-@wrapt.patch_function_wrapper('jupyterhub.proxy', 'ConfigurableHTTPProxy.add_route')
-def _wrapper_add_route(wrapped, instance, args, kwargs):
-    def _extract_args(routespec, target, data, *_args, **_kwargs):
-        return (routespec, target, data, _args, _kwargs)
-
-    routespec, target, data, _args, _kwargs = _extract_args(*args, **kwargs)
-
-    old = 'http://%s:%s' % (c.JupyterHub.hub_connect_ip, c.JupyterHub.hub_port)
-    new = 'http://127.0.0.1:%s' % c.JupyterHub.hub_port
-
-    if target.startswith(old):
-        target = target.replace(old, new)
-
-    return wrapped(routespec, target, data, *_args, **_kwargs)
-
-@wrapt.patch_function_wrapper('jupyterhub.spawner', 'LocalProcessSpawner.get_env')
-def _wrapper_get_env(wrapped, instance, args, kwargs):
-    env = wrapped(*args, **kwargs)
-
-    target = env.get('JUPYTERHUB_API_URL')
-
-    old = 'http://%s:%s' % (c.JupyterHub.hub_connect_ip, c.JupyterHub.hub_port)
-    new = 'http://127.0.0.1:%s' % c.JupyterHub.hub_port
-
-    if target and target.startswith(old):
-        target = target.replace(old, new)
-        env['JUPYTERHUB_API_URL'] = target
-
-    return env
-
-# Load configuration overrides based on configuration type.
-
-configuration_type = os.environ.get('CONFIGURATION_TYPE')
-
-if configuration_type:
-    config_file = '/opt/app-root/etc/jupyterhub_config-%s.py' % configuration_type
-
-    if os.path.exists(config_file):
-        with open(config_file) as fp:
-            exec(compile(fp.read(), config_file, 'exec'), globals())
-
-# Load configuration included in the image.
-
-image_config_file = '/opt/app-root/src/.jupyter/jupyterhub_config.py'
-
-if os.path.exists(image_config_file):
-    with open(image_config_file) as fp:
-        exec(compile(fp.read(), image_config_file, 'exec'), globals())
-
-# Load configuration provided via the environment.
-
-environ_config_file = '/opt/app-root/configs/jupyterhub_config.py'
-
-if os.path.exists(environ_config_file):
-    with open(environ_config_file) as fp:
-        exec(compile(fp.read(), environ_config_file, 'exec'), globals())
+if idle_timeout and int(idle_timeout):
+    c.JupyterHub.services.extend([
+        {
+            'name': 'cull-idle',
+            'admin': True,
+            'command': ['cull-idle-servers', '--timeout=%s' % idle_timeout]
+        }
+    ])
